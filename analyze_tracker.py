@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-GPS Tracker Battery Analysis Script
+GPS Tracker Battery Drain Analysis Tool
 
-Analyzes GPS tracker data to investigate battery drain by tracking:
-- Battery level (batl) over time
-- GSM signal level (gsmlev) fluctuations
-- Correlation between signal strength variations and battery consumption
+Analyzes GPS tracker battery performance to debug rapid battery drain issues.
 
-The script detects charging cycles (when battery reaches 100%) and analyzes
-each discharge period separately to identify patterns.
+Features:
+- Detects discharge cycles (battery 100% → drain → recharge)
+- Calculates battery drain rates and projected battery life
+- Tracks GSM signal stability and strength
+- Compares performance before/after configuration changes
+- Generates visual reports and statistics
+
+Author: Created for debugging Fifotrack GPS devices
+License: MIT
 """
 
 import pandas as pd
@@ -18,10 +22,43 @@ import re
 import sys
 
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Cycle detection parameters
+MIN_CYCLE_DURATION_HOURS = 1.0       # Minimum hours for a valid cycle
+MIN_BATTERY_DROP_PERCENT = 5         # Minimum % drop for a valid cycle
+RECHARGE_THRESHOLD_PERCENT = 10      # % increase to consider cycle ended
+BATTERY_DEPLETED_THRESHOLD = 5       # Battery level considered depleted
+
+# Default GSM lock timestamp (can be overridden via command line)
+DEFAULT_GSM_LOCK_TIME = '2025-11-03 09:42:00'
+
+# Output settings
+PLOT_DPI = 150                       # Resolution for output plots
+FIGURE_SIZE_TIMELINE = (16, 10)      # Size for timeline plots
+FIGURE_SIZE_COMPARISON = (14, 10)    # Size for comparison charts
+
+
+# ============================================================================
+# DATA PARSING
+# ============================================================================
+
 def parse_params(params_str):
-    """Parse the params string into a dictionary."""
+    """
+    Parse the params string from CSV into a dictionary.
+
+    The params column contains comma-separated key=value pairs like:
+    "batl=85, bats=0, batv=3.97, gsmlev=16, ..."
+
+    Args:
+        params_str (str): The params string from CSV
+
+    Returns:
+        dict: Dictionary with parsed key-value pairs
+    """
     params = {}
-    # Split by comma and parse key=value pairs
     pairs = params_str.split(', ')
     for pair in pairs:
         if '=' in pair:
@@ -31,20 +68,39 @@ def parse_params(params_str):
 
 
 def load_and_process_data(csv_file):
-    """Load CSV and extract batl and gsmlev from params column."""
+    """
+    Load GPS tracker CSV file and extract relevant metrics.
+
+    Extracts battery and GSM metrics from the params column:
+    - batl: Battery level (0-100%)
+    - bats: Battery charging status (0=discharging, 1=charging)
+    - batv: Battery voltage (V)
+    - gsmlev: GSM signal level
+
+    Args:
+        csv_file (str): Path to CSV file
+
+    Returns:
+        DataFrame: Processed data with extracted metrics
+    """
     df = pd.read_csv(csv_file)
 
-    # Parse params column
+    # Parse params column to extract metrics
     df['params_dict'] = df['params'].apply(parse_params)
     df['batl'] = df['params_dict'].apply(lambda x: int(x.get('batl', 0)))
     df['gsmlev'] = df['params_dict'].apply(lambda x: int(x.get('gsmlev', 0)))
     df['batv'] = df['params_dict'].apply(lambda x: float(x.get('batv', 0)))
     df['bats'] = df['params_dict'].apply(lambda x: int(x.get('bats', 0)))
 
-    # Convert datetime
+    # Convert timestamp to datetime
     df['dt_server'] = pd.to_datetime(df['dt_server'])
 
     return df
+
+
+# ============================================================================
+# CYCLE DETECTION
+# ============================================================================
 
 
 def detect_discharge_cycles(df, min_duration_hours=1.0, min_battery_drop=5, recharge_threshold=10):
@@ -148,8 +204,27 @@ def detect_discharge_cycles(df, min_duration_hours=1.0, min_battery_drop=5, rech
     return valid_cycles
 
 
+# ============================================================================
+# STATISTICS CALCULATION
+# ============================================================================
+
 def calculate_cycle_statistics(df, start_idx, end_idx, cycle_num, change_time):
-    """Calculate statistics for a discharge cycle."""
+    """
+    Calculate comprehensive statistics for a single discharge cycle.
+
+    Computes battery performance metrics, GSM signal statistics,
+    and determines cycle classification relative to configuration changes.
+
+    Args:
+        df (DataFrame): Full dataset
+        start_idx (int): Starting index of cycle
+        end_idx (int): Ending index of cycle
+        cycle_num (int): Cycle number for reporting
+        change_time (datetime): Timestamp of configuration change (or None)
+
+    Returns:
+        dict: Statistics including drain rate, GSM metrics, duration, etc.
+    """
     period_df = df.iloc[start_idx:end_idx+1].copy()
 
     if len(period_df) == 0:
@@ -222,8 +297,25 @@ def calculate_cycle_statistics(df, start_idx, end_idx, cycle_num, change_time):
     return stats
 
 
+# ============================================================================
+# VISUALIZATION
+# ============================================================================
+
 def plot_cycle_comparison(df, cycles, change_time, all_stats, output_prefix):
-    """Create visualizations comparing discharge cycles."""
+    """
+    Generate visualization plots for battery analysis.
+
+    Creates two PNG files:
+    1. Timeline plot showing battery, GSM signal, and voltage over time
+    2. Comparison bar charts for drain rates, stability, and duration
+
+    Args:
+        df (DataFrame): Full dataset
+        cycles (list): List of (start_idx, end_idx) tuples
+        change_time (datetime): Configuration change timestamp (or None)
+        all_stats (list): List of statistics dictionaries for each cycle
+        output_prefix (str): Filename prefix for output files
+    """
     # Overall timeline plot
     fig, axes = plt.subplots(3, 1, figsize=(16, 10))
 
@@ -353,13 +445,24 @@ def plot_cycle_comparison(df, cycles, change_time, all_stats, output_prefix):
         print(f"Cycle comparison plot saved to: {output_file2}")
 
 
+# ============================================================================
+# MAIN PROGRAM
+# ============================================================================
+
 def main():
-    # Configuration
+    """
+    Main entry point for GPS tracker battery analysis.
+
+    Handles command-line arguments, file selection, cycle detection,
+    statistical analysis, and report generation.
+    """
     import glob
     import os
     import argparse
 
-    # Parse command line arguments
+    # ========================================================================
+    # Command Line Argument Parsing
+    # ========================================================================
     parser = argparse.ArgumentParser(
         description='Analyze GPS tracker battery drain cycles',
         formatter_class=argparse.RawDescriptionHelpFormatter,
