@@ -47,70 +47,82 @@ def load_and_process_data(csv_file):
     return df
 
 
-def detect_discharge_cycles(df, min_duration_hours=1.0, min_battery_drop=5):
+def detect_discharge_cycles(df, min_duration_hours=1.0, min_battery_drop=5, recharge_threshold=10):
     """
     Detect periods where battery is discharging (going down).
     A discharge cycle starts when battery is at 100% or starts decreasing,
     and ends when:
-    - Battery starts charging again (bats changes or battery level increases)
+    - Battery increases by at least recharge_threshold% (indicating device was placed on charger)
     - Battery reaches very low level (near 0%)
-    - Battery reaches 100% again (recharged)
+    - Battery reaches 100% again (fully recharged)
     - End of data
 
-    Only includes meaningful discharge cycles (not brief charging interruptions).
+    Small battery fluctuations are ignored - only significant recharges end a cycle.
 
     Args:
         df: DataFrame with battery data
         min_duration_hours: Minimum duration in hours to consider a valid cycle
         min_battery_drop: Minimum battery level drop to consider a valid cycle
+        recharge_threshold: Minimum battery increase (%) to consider cycle ended (default: 10%)
 
     Returns a list of (start_idx, end_idx) tuples for each discharge cycle.
     """
     cycles = []
     in_cycle = False
     cycle_start_idx = None
-    prev_batl = None
-    prev_bats = None
+    cycle_min_battery = None  # Track minimum battery level in current cycle
 
     for idx in range(len(df)):
         batl = df.iloc[idx]['batl']
         bats = df.iloc[idx]['bats']  # Battery charging status (1=charging, 0=discharging)
 
-        # Start of a discharge cycle: battery at 100% or high level and not charging
-        if not in_cycle:
-            if batl == 100 or (prev_batl is not None and batl < prev_batl and bats == 0):
-                cycle_start_idx = idx
-                in_cycle = True
+        # Start of a discharge cycle: battery at 100%
+        if not in_cycle and batl == 100:
+            cycle_start_idx = idx
+            cycle_min_battery = batl
+            in_cycle = True
 
-        # Detect end of discharge cycle
+        # Track progress during discharge cycle
         elif in_cycle:
+            # Update minimum battery level seen in this cycle
+            if batl < cycle_min_battery:
+                cycle_min_battery = batl
+
             # End conditions:
-            # 1. Battery starts charging (bats changes from 0 to 1)
-            # 2. Battery level increases significantly (more than 2%, indicating charging started)
-            # 3. Battery reaches 100% again
-            # 4. Battery is very low (<=5%)
+            # 1. Battery increased significantly from the minimum (at least recharge_threshold%)
+            #    This indicates device was placed back on charger
+            # 2. Battery is very low (<=5%) - complete depletion
+            # 3. Battery reached 100% again (fully recharged)
 
-            battery_increased = prev_batl is not None and batl > prev_batl + 2
-            started_charging = prev_bats == 0 and bats == 1
-            reached_full = batl == 100 and idx > cycle_start_idx + 10
+            battery_recharged = batl >= cycle_min_battery + recharge_threshold
             battery_very_low = batl <= 5
+            reached_full = batl == 100 and idx > cycle_start_idx + 10
 
-            if started_charging or battery_increased or reached_full or battery_very_low:
+            if battery_recharged or battery_very_low or reached_full:
                 # End the current cycle
-                # Use idx-1 if we detected charging/increase, otherwise use idx
-                end_idx = idx - 1 if (started_charging or battery_increased) else idx
+                # If recharged, use the point just before recharge started
+                if battery_recharged:
+                    # Find where the battery was at its minimum before recharging
+                    end_idx = idx - 1
+                    # Look back to find the minimum point
+                    for back_idx in range(idx - 1, cycle_start_idx - 1, -1):
+                        if df.iloc[back_idx]['batl'] == cycle_min_battery:
+                            end_idx = back_idx
+                            break
+                else:
+                    end_idx = idx
+
                 cycles.append((cycle_start_idx, end_idx))
 
                 # Start a new cycle if battery is at 100% after this
                 if reached_full:
                     cycle_start_idx = idx
+                    cycle_min_battery = batl
                     in_cycle = True
                 else:
                     in_cycle = False
                     cycle_start_idx = None
-
-        prev_batl = batl
-        prev_bats = bats
+                    cycle_min_battery = None
 
     # Add the last cycle if we're still in one
     if in_cycle and cycle_start_idx is not None:
@@ -147,7 +159,9 @@ def calculate_cycle_statistics(df, start_idx, end_idx, cycle_num, change_time):
     end_time = period_df.iloc[-1]['dt_server']
 
     # Determine if this cycle is before or after the GSM change
-    if start_time < change_time:
+    if change_time is None:
+        mode = "No GSM Lock"
+    elif start_time < change_time:
         mode = "Before GSM Lock (Auto)"
     else:
         mode = "After GSM Lock (4G Only)"
@@ -208,44 +222,77 @@ def calculate_cycle_statistics(df, start_idx, end_idx, cycle_num, change_time):
     return stats
 
 
-def plot_cycle_comparison(df, cycles, change_time, all_stats):
+def plot_cycle_comparison(df, cycles, change_time, all_stats, output_prefix):
     """Create visualizations comparing discharge cycles."""
     # Overall timeline plot
     fig, axes = plt.subplots(3, 1, figsize=(16, 10))
 
     # Plot 1: Battery level over time with cycle boundaries
-    axes[0].plot(df['dt_server'], df['batl'], marker='o', markersize=1, linewidth=1)
-    axes[0].axvline(x=change_time, color='red', linestyle='--', linewidth=2, label='GSM Band Lock Change')
+    axes[0].plot(df['dt_server'], df['batl'], marker='o', markersize=1, linewidth=1, alpha=0.6)
 
-    # Mark cycle boundaries
+    if change_time is not None:
+        axes[0].axvline(x=change_time, color='red', linestyle='--', linewidth=2, label='GSM Band Lock Change')
+
+    # Mark cycle boundaries and shade cycle regions
+    colors_cycle = plt.cm.Set3(range(len(cycles)))
     for i, (start_idx, end_idx) in enumerate(cycles):
         start_time = df.iloc[start_idx]['dt_server']
-        axes[0].axvline(x=start_time, color='green', linestyle=':', alpha=0.5, linewidth=1)
+        end_time = df.iloc[end_idx]['dt_server']
+
+        # Shade the cycle region
+        axes[0].axvspan(start_time, end_time, alpha=0.2, color=colors_cycle[i % len(colors_cycle)])
+
+        # Add cycle label at the top
+        mid_time = start_time + (end_time - start_time) / 2
+        axes[0].text(mid_time, axes[0].get_ylim()[1] * 0.95, f'C{i+1}',
+                    ha='center', va='top', fontsize=8, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor=colors_cycle[i % len(colors_cycle)], alpha=0.5))
 
     axes[0].set_ylabel('Battery Level (%)')
-    axes[0].set_title('Battery Level Over Time - Discharge Cycles Marked')
+    axes[0].set_title(f'Battery Level Over Time - {len(cycles)} Discharge Cycles')
     axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
+    if change_time is not None:
+        axes[0].legend()
 
-    # Plot 2: GSM signal level over time
-    axes[1].plot(df['dt_server'], df['gsmlev'], marker='o', markersize=1, linewidth=1, color='orange')
-    axes[1].axvline(x=change_time, color='red', linestyle='--', linewidth=2, label='GSM Band Lock Change')
+    # Plot 2: GSM signal level over time with cycle regions
+    axes[1].plot(df['dt_server'], df['gsmlev'], marker='o', markersize=1, linewidth=1, color='orange', alpha=0.6)
+
+    if change_time is not None:
+        axes[1].axvline(x=change_time, color='red', linestyle='--', linewidth=2, label='GSM Band Lock Change')
+
+    # Shade cycle regions
+    for i, (start_idx, end_idx) in enumerate(cycles):
+        start_time = df.iloc[start_idx]['dt_server']
+        end_time = df.iloc[end_idx]['dt_server']
+        axes[1].axvspan(start_time, end_time, alpha=0.2, color=colors_cycle[i % len(colors_cycle)])
+
     axes[1].set_ylabel('GSM Signal Level')
     axes[1].set_title('GSM Signal Level Over Time')
     axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
+    if change_time is not None:
+        axes[1].legend()
 
-    # Plot 3: Battery voltage over time
-    axes[2].plot(df['dt_server'], df['batv'], marker='o', markersize=1, linewidth=1, color='green')
-    axes[2].axvline(x=change_time, color='red', linestyle='--', linewidth=2, label='GSM Band Lock Change')
+    # Plot 3: Battery voltage over time with cycle regions
+    axes[2].plot(df['dt_server'], df['batv'], marker='o', markersize=1, linewidth=1, color='green', alpha=0.6)
+
+    if change_time is not None:
+        axes[2].axvline(x=change_time, color='red', linestyle='--', linewidth=2, label='GSM Band Lock Change')
+
+    # Shade cycle regions
+    for i, (start_idx, end_idx) in enumerate(cycles):
+        start_time = df.iloc[start_idx]['dt_server']
+        end_time = df.iloc[end_idx]['dt_server']
+        axes[2].axvspan(start_time, end_time, alpha=0.2, color=colors_cycle[i % len(colors_cycle)])
+
     axes[2].set_ylabel('Battery Voltage (V)')
     axes[2].set_xlabel('Time')
     axes[2].set_title('Battery Voltage Over Time')
     axes[2].grid(True, alpha=0.3)
-    axes[2].legend()
+    if change_time is not None:
+        axes[2].legend()
 
     plt.tight_layout()
-    output_file = 'tracker_analysis_cycles.png'
+    output_file = f'{output_prefix}_analysis_cycles.png'
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"\nCycle timeline plot saved to: {output_file}")
 
@@ -301,7 +348,7 @@ def plot_cycle_comparison(df, cycles, change_time, all_stats):
         fig2.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98))
 
         plt.tight_layout()
-        output_file2 = 'tracker_cycle_comparison.png'
+        output_file2 = f'{output_prefix}_cycle_comparison.png'
         plt.savefig(output_file2, dpi=150, bbox_inches='tight')
         print(f"Cycle comparison plot saved to: {output_file2}")
 
@@ -310,6 +357,27 @@ def main():
     # Configuration
     import glob
     import os
+    import argparse
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Analyze GPS tracker battery drain cycles',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 analyze_tracker.py
+  python3 analyze_tracker.py --file "fifotrack1Q3 2025-11-01 00_00_00-2025-11-04 00_00_00.csv"
+  python3 analyze_tracker.py --gsm-lock "2025-11-03 09:42:00"
+  python3 analyze_tracker.py --file "fifotrack2Q3 2025-10-01 00_00_00-2025-11-04 00_00_00.csv" --no-gsm-lock
+        """
+    )
+    parser.add_argument('--file', '-f', type=str, help='CSV file to analyze (or file number)')
+    parser.add_argument('--gsm-lock', '-g', type=str, default='2025-11-03 09:42:00',
+                       help='Timestamp when GSM band was locked to 4G (default: 2025-11-03 09:42:00)')
+    parser.add_argument('--no-gsm-lock', action='store_true',
+                       help='Disable GSM lock analysis (no before/after comparison)')
+
+    args = parser.parse_args()
 
     # Find all CSV files in current directory
     csv_files = sorted(glob.glob('*.csv'))
@@ -318,49 +386,60 @@ def main():
         print("No CSV files found in current directory!")
         return
 
-    # If multiple CSV files, let user choose
-    if len(csv_files) > 1:
+    # Determine which file to use
+    csv_file = None
+    if args.file:
+        # Check if it's a number
+        try:
+            choice = int(args.file)
+            if 1 <= choice <= len(csv_files):
+                csv_file = csv_files[choice - 1]
+            else:
+                print(f"Invalid choice. Please select 1-{len(csv_files)}")
+                return
+        except ValueError:
+            # Treat as filename
+            if os.path.exists(args.file):
+                csv_file = args.file
+            else:
+                print(f"File not found: {args.file}")
+                return
+    elif len(csv_files) > 1:
+        # Interactive selection
         print("Available CSV files:")
         for i, f in enumerate(csv_files, 1):
             # Get file size
             size_mb = os.path.getsize(f) / (1024 * 1024)
             print(f"  {i}. {f} ({size_mb:.2f} MB)")
 
-        # Check if file specified as command line argument
-        if len(sys.argv) > 1:
+        while True:
             try:
-                choice = int(sys.argv[1])
+                choice = int(input(f"\nSelect file (1-{len(csv_files)}): "))
                 if 1 <= choice <= len(csv_files):
                     csv_file = csv_files[choice - 1]
+                    break
                 else:
-                    print(f"Invalid choice. Please select 1-{len(csv_files)}")
-                    return
+                    print(f"Please enter a number between 1 and {len(csv_files)}")
             except ValueError:
-                # Treat as filename
-                csv_file = sys.argv[1]
-                if not os.path.exists(csv_file):
-                    print(f"File not found: {csv_file}")
-                    return
-        else:
-            # Interactive selection
-            while True:
-                try:
-                    choice = int(input(f"\nSelect file (1-{len(csv_files)}): "))
-                    if 1 <= choice <= len(csv_files):
-                        csv_file = csv_files[choice - 1]
-                        break
-                    else:
-                        print(f"Please enter a number between 1 and {len(csv_files)}")
-                except ValueError:
-                    print("Please enter a valid number")
-                except (KeyboardInterrupt, EOFError):
-                    print("\nCancelled")
-                    return
+                print("Please enter a valid number")
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled")
+                return
     else:
         csv_file = csv_files[0]
 
-    # GSM band lock change time - adjust this for your specific case
-    change_time = pd.to_datetime('2025-11-03 09:42:00')
+    # GSM band lock change time
+    if args.no_gsm_lock:
+        change_time = None
+        print("\nGSM lock analysis disabled - all cycles will be treated equally")
+    else:
+        try:
+            change_time = pd.to_datetime(args.gsm_lock)
+            print(f"\nGSM band lock timestamp: {change_time}")
+        except Exception as e:
+            print(f"Error parsing GSM lock timestamp: {e}")
+            print("Using default: 2025-11-03 09:42:00")
+            change_time = pd.to_datetime('2025-11-03 09:42:00')
 
     print("=" * 80)
     print("GPS Tracker Battery Drain Analysis - Discharge Cycle Report")
@@ -376,11 +455,12 @@ def main():
     print("\n" + "=" * 80)
     print("DETECTING DISCHARGE CYCLES")
     print("=" * 80)
-    print("Filtering criteria:")
-    print("  - Minimum duration: 1.0 hours")
-    print("  - OR minimum battery drop: 5%")
-    cycles = detect_discharge_cycles(df, min_duration_hours=1.0, min_battery_drop=5)
-    print(f"\nFound {len(cycles)} meaningful discharge cycles (excluding short charging interruptions)")
+    print("Cycle detection criteria:")
+    print("  - Cycle starts: Battery at 100%")
+    print("  - Cycle ends: Battery increases by 10%+ OR depletes (≤5%) OR reaches 100%")
+    print("  - Minimum duration: 1.0 hours OR minimum battery drop: 5%")
+    cycles = detect_discharge_cycles(df, min_duration_hours=1.0, min_battery_drop=5, recharge_threshold=10)
+    print(f"\nFound {len(cycles)} meaningful discharge cycles")
 
     # Calculate statistics for each cycle
     all_stats = []
@@ -435,7 +515,7 @@ def main():
     before_cycles = [s for s in all_stats if s['mode'].startswith('Before')]
     after_cycles = [s for s in all_stats if s['mode'].startswith('After')]
 
-    if before_cycles and after_cycles:
+    if change_time is not None and (before_cycles or after_cycles):
         print("\n" + "=" * 80)
         print("SUMMARY: BEFORE vs AFTER GSM BAND LOCK")
         print("=" * 80)
@@ -467,11 +547,35 @@ def main():
         print(f"  Battery Drain: {drain_improvement:+.1f}% ({'better' if drain_improvement > 0 else 'worse'})")
         print(f"  GSM Stability: {stability_improvement:+.1f}% ({'better' if stability_improvement > 0 else 'worse'})")
         print(f"  GSM Strength:  {after_avg_gsm_mean - before_avg_gsm_mean:+.2f}")
+    elif change_time is None and all_stats:
+        # Show overall summary when no GSM lock
+        print("\n" + "=" * 80)
+        print("OVERALL SUMMARY")
+        print("=" * 80)
+
+        avg_drain = sum(s['batl_drain_rate_per_hour'] for s in all_stats) / len(all_stats)
+        avg_gsm_std = sum(s['gsmlev_std'] for s in all_stats) / len(all_stats)
+        avg_gsm_mean = sum(s['gsmlev_mean'] for s in all_stats) / len(all_stats)
+        avg_duration = sum(s['duration_hours'] for s in all_stats) / len(all_stats)
+
+        print(f"\nAcross {len(all_stats)} discharge cycle(s):")
+        print(f"  Average Battery Drain: {avg_drain:.2f}% per hour")
+        print(f"  Average GSM Stability: {avg_gsm_std:.2f} (std dev)")
+        print(f"  Average GSM Strength:  {avg_gsm_mean:.2f}")
+        print(f"  Average Cycle Duration: {avg_duration:.2f} hours ({avg_duration/24:.2f} days)")
+
+    # Create output prefix from CSV filename
+    # Remove extension and path, keep just the base name
+    import os
+    base_name = os.path.splitext(os.path.basename(csv_file))[0]
+    # Replace spaces with underscores for cleaner filenames
+    output_prefix = base_name.replace(' ', '_')
 
     # Create visualizations
     print("\n" + "=" * 80)
     print("Generating visualizations...")
-    plot_cycle_comparison(df, cycles, change_time, all_stats)
+    print(f"Output prefix: {output_prefix}")
+    plot_cycle_comparison(df, cycles, change_time, all_stats, output_prefix)
 
     print("\n" + "=" * 80)
     print("Analysis complete!")
